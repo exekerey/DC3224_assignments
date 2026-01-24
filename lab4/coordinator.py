@@ -32,6 +32,8 @@ TIMEOUT_S: float = 2.0
 TX: Dict[str, Dict[str, Any]] = {}
 WAL_PATH: Optional[str] = None
 DECISION_RETRIES: int = 3
+PRECOMMIT_RETRIES: int = 3
+DECISION_DELAY_S: float = 0.0
 
 def jdump(obj: Any) -> bytes:
     return json.dumps(obj).encode("utf-8")
@@ -76,6 +78,27 @@ def record_decision(txid: str, decision: str, votes: Optional[Dict[str, str]] = 
     if log:
         wal_append_decision({"txid": txid, "decision": decision})
 
+def propagate_precommit(txid: str, retries: int = PRECOMMIT_RETRIES) -> List[str]:
+    with lock:
+        rec = TX.get(txid)
+        participants = list(rec.get("participants", PARTICIPANTS)) if rec else list(PARTICIPANTS)
+    pending = list(participants)
+    for attempt in range(retries):
+        if not pending:
+            break
+        next_pending: List[str] = []
+        for p in pending:
+            try:
+                post_json(p.rstrip("/") + "/precommit", {"txid": txid})
+            except Exception:
+                next_pending.append(p)
+        pending = next_pending
+        if pending:
+            time.sleep(min(0.5 * (attempt + 1), 2.0))
+    if pending:
+        print(f"[{NODE_ID}] precommit for {txid} pending delivery to: {pending}")
+    return pending
+
 def propagate_decision(txid: str, decision: str, retries: int = DECISION_RETRIES) -> List[str]:
     endpoint = "/commit" if decision == "COMMIT" else "/abort"
     with lock:
@@ -113,12 +136,16 @@ def replay_wal() -> None:
                     continue
                 txid = str(rec.get("txid", "")).strip()
                 decision = str(rec.get("decision", "")).upper()
-                if not txid or decision not in ("COMMIT", "ABORT"):
+                if not txid or decision not in ("COMMIT", "ABORT", "PRECOMMIT"):
                     continue
-                record_decision(txid, decision, log=False)
-                propagate_decision(txid, decision)
-                with lock:
-                    TX[txid]["state"] = "DONE"
+                if decision == "PRECOMMIT":
+                    record_decision(txid, decision, log=False)
+                    propagate_precommit(txid)
+                else:
+                    record_decision(txid, decision, log=False)
+                    propagate_decision(txid, decision)
+                    with lock:
+                        TX[txid]["state"] = "DONE"
     except FileNotFoundError:
         return
 
@@ -147,7 +174,8 @@ def two_pc(txid: str, op: dict) -> dict:
     decision = "COMMIT" if all_yes else "ABORT"
     with lock:
         TX[txid]["votes"] = votes
-
+    if DECISION_DELAY_S > 0:
+        time.sleep(DECISION_DELAY_S)
     record_decision(txid, decision, votes=votes)
     propagate_decision(txid, decision)
 
@@ -190,14 +218,19 @@ def three_pc(txid: str, op: dict) -> dict:
     with lock:
         TX[txid]["decision"] = "PRECOMMIT"
         TX[txid]["state"] = "PRECOMMIT_SENT"
+        TX[txid]["ts"] = time.time()
 
-    for p in PARTICIPANTS:
-        try:
-            post_json(p.rstrip("/") + "/precommit", {"txid": txid})
-        except Exception:
-            # YOUR CODE HERE (bonus): handle retries/timeouts
-            pass
+    record_decision(txid, "PRECOMMIT")
+    pending = propagate_precommit(txid)
+    if pending:
+        record_decision(txid, "ABORT", votes=votes)
+        propagate_decision(txid, "ABORT")
+        with lock:
+            TX[txid]["state"] = "DONE"
+        return {"ok": True, "txid": txid, "protocol": "3PC", "decision": "ABORT", "votes": votes, "error": f"precommit undelivered: {pending}"}
 
+    if DECISION_DELAY_S > 0:
+        time.sleep(DECISION_DELAY_S)
     record_decision(txid, "COMMIT")
     propagate_decision(txid, "COMMIT")
 
@@ -257,19 +290,21 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 def main():
-    global NODE_ID, PORT, PARTICIPANTS, WAL_PATH
+    global NODE_ID, PORT, PARTICIPANTS, WAL_PATH, DECISION_DELAY_S
     ap = argparse.ArgumentParser()
     ap.add_argument("--id", default="COORD")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--participants", required=True, help="Comma-separated participant base URLs (http://IP:PORT)")
     ap.add_argument("--wal", default="", help="Optional coordinator WAL path")
+    ap.add_argument("--decision-delay", type=float, default=0.0, help="Seconds to wait after votes/PRECOMMIT before final decision (demo helper)")
     args = ap.parse_args()
 
     NODE_ID = args.id
     PORT = args.port
     PARTICIPANTS = [p.strip() for p in args.participants.split(",") if p.strip()]
     WAL_PATH = args.wal.strip() or None
+    DECISION_DELAY_S = max(0.0, float(args.decision_delay))
 
     replay_wal()
 

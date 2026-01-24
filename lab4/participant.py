@@ -22,7 +22,7 @@ import json
 import os
 import threading
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 lock = threading.Lock()
 
@@ -33,6 +33,8 @@ kv: Dict[str, str] = {}
 TX: Dict[str, Dict[str, Any]] = {}
 
 WAL_PATH: Optional[str] = None
+PRECOMMIT_TIMEOUT_S: float = 3.0
+WATCH_INTERVAL_S: float = 0.5
 
 def jdump(obj: Any) -> bytes:
     return json.dumps(obj).encode("utf-8")
@@ -76,6 +78,7 @@ def wal_replay() -> None:
                 elif action == "PRECOMMIT":
                     rec = TX.setdefault(txid, {"state": "PRECOMMIT", "op": None, "ts": time.time()})
                     rec["state"] = "PRECOMMIT"
+                    rec["ts"] = time.time()
                 elif action == "COMMIT":
                     rec = TX.get(txid)
                     if rec and rec.get("op") and rec.get("state") != "COMMITTED":
@@ -84,6 +87,7 @@ def wal_replay() -> None:
                         TX[txid] = {"state": "COMMITTED", "op": None, "ts": time.time()}
                     else:
                         rec["state"] = "COMMITTED"
+                        rec["ts"] = time.time()
                 elif action == "ABORT":
                     rec = TX.get(txid)
                     if not rec:
@@ -109,6 +113,40 @@ def apply_op(op: dict) -> None:
         kv[k] = v
         return
     # YOUR CODE HERE (optional): add DEL/INCR/TRANSFER etc.
+
+def try_commit(txid: str) -> str:
+    with lock:
+        rec = TX.get(txid)
+        if not rec:
+            return "unknown"
+        state = rec.get("state")
+        if state == "COMMITTED":
+            return "already"
+        if state not in ("READY", "PRECOMMIT"):
+            return "invalid"
+        op = rec.get("op")
+        if op:
+            apply_op(op)
+        rec["state"] = "COMMITTED"
+        rec["ts"] = time.time()
+    wal_append(f"{txid} COMMIT")
+    return "committed"
+
+def watchdog_loop():
+    while True:
+        time.sleep(WATCH_INTERVAL_S)
+        now = time.time()
+        candidates: List[str] = []
+        with lock:
+            for txid, rec in TX.items():
+                if rec.get("state") == "PRECOMMIT":
+                    ts = rec.get("ts", now)
+                    if now - ts >= PRECOMMIT_TIMEOUT_S:
+                        candidates.append(txid)
+        for txid in candidates:
+            res = try_commit(txid)
+            if res == "committed":
+                print(f"[{NODE_ID}] auto-committed {txid} after PRECOMMIT timeout")
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict):
@@ -156,17 +194,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"ok": False, "error": "txid required"})
                 return
 
-            with lock:
-                rec = TX.get(txid)
-                if not rec:
-                    self._send(409, {"ok": False, "error": "unknown txid"})
-                    return
-                if rec["state"] not in ("READY", "PRECOMMIT"):
-                    self._send(409, {"ok": False, "error": f"cannot commit from state={rec['state']}"})
-                    return
-                apply_op(rec["op"])
-                rec["state"] = "COMMITTED"
-            wal_append(f"{txid} COMMIT")
+            result = try_commit(txid)
+            if result == "unknown":
+                self._send(409, {"ok": False, "error": "unknown txid"})
+                return
+            if result == "invalid":
+                with lock:
+                    state = TX.get(txid, {}).get("state", "UNKNOWN")
+                self._send(409, {"ok": False, "error": f"cannot commit from state={state}"})
+                return
 
             self._send(200, {"ok": True, "txid": txid, "state": "COMMITTED"})
             return
@@ -211,6 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(409, {"ok": False, "error": "precommit requires READY state"})
                     return
                 rec["state"] = "PRECOMMIT"
+                rec["ts"] = time.time()
             wal_append(f"{txid} PRECOMMIT")
             self._send(200, {"ok": True, "txid": txid, "state": "PRECOMMIT"})
             return
@@ -234,6 +271,9 @@ def main():
     WAL_PATH = args.wal.strip() or None
 
     wal_replay()
+
+    t = threading.Thread(target=watchdog_loop, daemon=True)
+    t.start()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[{NODE_ID}] Participant listening on {args.host}:{args.port} wal={WAL_PATH}")
